@@ -1,0 +1,166 @@
+name: Build & Test Greenpack Pro
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+jobs:
+  # ── Backend Tests ─────────────────────────────────────────────────────────────
+  test-backend:
+    name: Backend Tests (Python)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov anyio httpx
+
+      - name: Create test directories
+        run: |
+          cd backend
+          mkdir -p data files reports templates models logs temp backups
+
+      - name: Copy test env
+        run: |
+          cd backend
+          cp .env.example .env
+          echo "EASYOCR_DOWNLOAD_ENABLED=true" >> .env
+          echo "LOG_LEVEL=WARNING" >> .env
+
+      - name: Run unit tests
+        run: |
+          cd backend
+          python -m pytest tests/test_all.py \
+            -v \
+            --tb=short \
+            -x \
+            --ignore=tests/test_all.py \
+            -k "TestAlignment or TestColorService or TestSSIMService or TestBarcodeService or TestPreprocess or TestScoreCalculation or TestAuthService or TestBackupService" \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing
+
+      - name: Run integration tests
+        run: |
+          cd backend
+          python -m pytest tests/test_all.py \
+            -v \
+            --tb=short \
+            -k "test_health or test_login or test_protected or test_list_jobs or test_scanner or test_settings or test_templates or test_dashboard" \
+            --timeout=60
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: backend/coverage.xml
+          fail_ci_if_error: false
+
+  # ── Frontend Build ────────────────────────────────────────────────────────────
+  build-frontend:
+    name: Frontend Build (TypeScript/React)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: cd frontend && npm ci
+
+      - name: Build
+        run: cd frontend && npm run build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+
+  # ── Windows Installer Build ────────────────────────────────────────────────────
+  build-windows:
+    name: Build Windows Installer
+    runs-on: windows-latest
+    needs: [test-backend, build-frontend]
+    if: github.event_name == 'release'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python dependencies + PyInstaller
+        run: |
+          cd backend
+          pip install -r requirements.txt pyinstaller==6.8.0
+
+      - name: Download EasyOCR models
+        run: |
+          cd backend
+          python -c "
+          import easyocr
+          import os
+          os.makedirs('models', exist_ok=True)
+          reader = easyocr.Reader(['en'], gpu=False, model_storage_directory='models', download_enabled=True)
+          print('Models downloaded')
+          "
+
+      - name: Build Python engine (PyInstaller)
+        run: |
+          cd backend
+          pyinstaller greenpack_engine.spec --clean --noconfirm
+
+      - name: Build Electron app
+        run: |
+          cd electron
+          npm ci
+          npm run dist-win
+
+      - name: Download Inno Setup
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Build Inno Setup installer
+        run: |
+          iscc installer/GreenpackPro.iss /DAppVersion=${{ github.event.release.tag_name }}
+
+      - name: Sign installer (if certificate available)
+        if: env.CODESIGN_CERT != ''
+        run: |
+          echo "$env:CODESIGN_CERT" | base64 --decode > cert.pfx
+          signtool sign /f cert.pfx /p "$env:CERT_PASS" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist/installer/GreenpackPro_Setup_*.exe
+        env:
+          CODESIGN_CERT: ${{ secrets.CODESIGN_CERT }}
+          CERT_PASS: ${{ secrets.CERT_PASS }}
+
+      - name: Upload installer to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/GreenpackPro_Setup_*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
